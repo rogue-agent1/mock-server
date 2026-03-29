@@ -1,48 +1,83 @@
 #!/usr/bin/env python3
-"""Mock HTTP server for testing."""
-import sys,socket,json,threading,time
+"""mock_server - In-memory mock HTTP server for testing."""
+import sys, re, json
+
+class MockRequest:
+    def __init__(self, method, path, headers=None, body=None, query=None):
+        self.method = method.upper()
+        self.path = path
+        self.headers = headers or {}
+        self.body = body
+        self.query = query or {}
+
+class MockResponse:
+    def __init__(self, status=200, body=None, headers=None):
+        self.status = status
+        self.body = body
+        self.headers = headers or {"Content-Type": "application/json"}
+
 class MockServer:
-    def __init__(self,port=0):
-        self.routes={};self.requests=[];self.sock=socket.socket()
-        self.sock.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1)
-        self.sock.bind(('127.0.0.1',port));self.sock.listen(5)
-        self.port=self.sock.getsockname()[1];self._running=True
-        self._thread=threading.Thread(target=self._serve,daemon=True);self._thread.start()
-    def route(self,method,path,status=200,body="",headers=None):
-        self.routes[(method.upper(),path)]=(status,body,headers or {})
-    def _serve(self):
-        while self._running:
-            try:
-                self.sock.settimeout(0.5);conn,_=self.sock.accept()
-                data=conn.recv(4096).decode();lines=data.split('\r\n')
-                method,path,_=lines[0].split(' ',2)
-                self.requests.append({"method":method,"path":path,"raw":data})
-                key=(method,path)
-                if key in self.routes:
-                    status,body,hdrs=self.routes[key]
-                else: status,body,hdrs=404,"Not Found",{}
-                if isinstance(body,dict): body=json.dumps(body);hdrs["Content-Type"]="application/json"
-                resp=f"HTTP/1.1 {status} OK\r\nContent-Length: {len(body)}\r\n"
-                for k,v in hdrs.items(): resp+=f"{k}: {v}\r\n"
-                resp+=f"\r\n{body}"
-                conn.sendall(resp.encode());conn.close()
-            except socket.timeout: pass
-    def stop(self): self._running=False;self.sock.close()
-    @property
-    def url(self): return f"http://127.0.0.1:{self.port}"
-def main():
-    server=MockServer()
-    server.route("GET","/api/users",200,{"users":[{"id":1,"name":"Alice"}]})
-    server.route("POST","/api/users",201,{"id":2,"name":"Bob"})
-    server.route("GET","/health",200,"OK")
-    print(f"Mock server at {server.url}")
-    # Test with socket
-    import urllib.request
-    for path in ["/api/users","/health","/missing"]:
-        try:
-            resp=urllib.request.urlopen(f"{server.url}{path}")
-            print(f"  GET {path}: {resp.status} {resp.read().decode()}")
-        except Exception as e: print(f"  GET {path}: {e}")
-    print(f"\nRequests logged: {len(server.requests)}")
-    server.stop()
-if __name__=="__main__": main()
+    def __init__(self):
+        self.routes = []
+        self.requests = []
+        self.default_response = MockResponse(404, {"error": "Not Found"})
+    def when(self, method, path_pattern):
+        route = {"method": method.upper(), "pattern": re.compile(f"^{path_pattern}$"), "response": None, "count": 0}
+        self.routes.append(route)
+        return RouteBuilder(route)
+    def handle(self, request):
+        self.requests.append(request)
+        for route in self.routes:
+            if route["method"] == request.method and route["pattern"].match(request.path):
+                route["count"] += 1
+                resp = route["response"]
+                if callable(resp):
+                    return resp(request)
+                return resp
+        return self.default_response
+    def verify(self, method, path, times=None):
+        count = sum(1 for r in self.requests if r.method == method.upper() and r.path == path)
+        if times is not None:
+            return count == times
+        return count > 0
+    def reset(self):
+        self.requests.clear()
+        for r in self.routes:
+            r["count"] = 0
+
+class RouteBuilder:
+    def __init__(self, route):
+        self.route = route
+    def respond(self, status=200, body=None):
+        self.route["response"] = MockResponse(status, body)
+        return self
+    def respond_with(self, handler):
+        self.route["response"] = handler
+        return self
+
+def test():
+    server = MockServer()
+    server.when("GET", "/users").respond(200, [{"id": 1, "name": "Alice"}])
+    server.when("POST", "/users").respond(201, {"id": 2})
+    server.when("GET", "/users/\d+").respond_with(
+        lambda req: MockResponse(200, {"id": req.path.split("/")[-1]})
+    )
+    r1 = server.handle(MockRequest("GET", "/users"))
+    assert r1.status == 200
+    assert len(r1.body) == 1
+    r2 = server.handle(MockRequest("POST", "/users", body={"name": "Bob"}))
+    assert r2.status == 201
+    r3 = server.handle(MockRequest("GET", "/users/42"))
+    assert r3.status == 200 and r3.body["id"] == "42"
+    r4 = server.handle(MockRequest("DELETE", "/nope"))
+    assert r4.status == 404
+    assert server.verify("GET", "/users", times=1)
+    assert server.verify("POST", "/users")
+    assert not server.verify("PUT", "/users")
+    print("OK: mock_server")
+
+if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] == "test":
+        test()
+    else:
+        print("Usage: mock_server.py test")

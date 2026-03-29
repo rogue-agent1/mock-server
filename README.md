@@ -1,5 +1,11 @@
 # mock-server
-Mock HTTP server for testing. Zero dependencies.
+
+In-memory mock HTTP server for testing.
+
+## Usage
+
 ```bash
-python3 mock_server.py
+python3 mock_server.py test
 ```
+
+Zero dependencies. Python 3.8+.
